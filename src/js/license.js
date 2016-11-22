@@ -57,6 +57,8 @@ function cacheLicense(interactive, callback) {
       return callback(null);
     }
 
+    console.info(token);
+
     const req = new XMLHttpRequest();
     req.open('GET', CWS_LICENSE_API_URL + chrome.runtime.id);
     req.setRequestHeader('Authorization', `Bearer ${token}`);
@@ -106,6 +108,7 @@ exports.hasFullVersion = function hasFullVersion(interactive, callback) {
 
     if (interactive) {
       // Always invalidate the cache on interactive checks.
+      console.log('invalidating cached license');
       cacheLicense(interactive, cachedLicense => {
         callback(checkCachedLicense(cachedLicense));
       });

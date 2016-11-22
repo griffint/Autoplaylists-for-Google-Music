@@ -4,6 +4,7 @@ const Qs = require('qs');
 
 const Chrometools = require('./chrometools');
 const Gm = require('./googlemusic');
+const Gmoauth = require('./googlemusic_oauth');
 const Lf = require('lovefield');  // made available for debugQuery eval
 const License = require('./license');
 const Playlist = require('./playlist');
@@ -15,8 +16,7 @@ const Splaylistcache = require('./splaylistcache');
 const Context = require('./context');
 const Reporting = require('./reporting');
 
-
-// {userId: {userIndex: int, tabId: int, xt: string}}
+// {userId: {userIndex: int, tabId: int, xt: string, tier: string, gaiaId: string}}
 const users = {};
 
 // {userId: <lovefield db>}
@@ -146,6 +146,7 @@ function syncPlaylistContents(playlist, attempt) {
     const desiredTracks = tracks.slice(0, 1000);
 
     Gm.setPlaylistContents(db, user, playlist.remoteId, desiredTracks, response => {
+    // Gmoauth.setPlaylistContents(db, user, playlist.remoteId, desiredTracks, splaylistcache, response => {
       if (response !== null) {
         // large updates seem to only apply partway sometimes.
         // retrying like this seems to make even 1k playlists eventually consistent.
@@ -202,34 +203,226 @@ function syncPlaylistContents(playlist, attempt) {
   });
 }
 
+function getDescription(playlist, splaylistcache, playlists) {
+  const rulesRepr = Playlist.toString(playlist, playlists, splaylistcache);
+  return `Synced ${new Date().toLocaleString()} by Autoplaylists for Google Music™ to contain: ${rulesRepr}.`;
+}
+
+function getPlaylistMutations(playlist, splaylistcache, playlists) {
+  const description = getDescription(playlist, splaylistcache, playlists);
+  const update = Gmoauth.buildPlaylistUpdates([{id: playlist.remoteId, name: playlist.title, description}]);
+  return update;
+}
+
+
+function getEntryMutations(playlist, splaylistcache, callback) {
+  const mutations = [];
+
+  console.log('cache', playlist.remoteId, splaylistcache);
+  let entries = [];
+  if (playlist.remoteId in splaylistcache.splaylists) {
+    entries = splaylistcache.splaylists[playlist.remoteId].entries;
+  } else {
+    console.warn('playlist.remoteId', playlist.remoteId, 'not yet cached; assuming empty');
+  }
+
+  // Don't delete tracks that are currently playing.
+  // This will put them at the top of the playlist until they're finished.
+
+  // Copy the entries to allow modifications and index on track id.
+  // If there are multiple entries for the same track we'll just leave all of them
+  // (since we can't tell which one is actually playing).
+  const tracksToDelete = {};
+  for (const entryId in entries) {
+    tracksToDelete[entries[entryId]] = entryId;
+  }
+
+  const db = dbs[playlist.userId];
+  const candidateTrackIds = Object.keys(tracksToDelete);
+  console.log('candidates', candidateTrackIds);
+  const track = db.getSchema().table('Track');
+  db.select().from(track).where(
+    // We don't know if these entries name a library or store id.
+    Lf.op.or(track.id.in(candidateTrackIds),
+             track.storeId.in(candidateTrackIds))
+  ).exec().then(rows => {
+    const nowMillis = new Date().getTime();
+    const delayMillis = 0;
+
+    rows.forEach(row => {
+      console.log('check', row, 'for playing', lastPlayed, playtime);
+      const lastPlayed = delayMillis + (row.lastPlayed / 1000);
+      const playtime = nowMillis - row.durationMillis;
+      if (lastPlayed > playtime) {
+        console.info('not deleting', row, 'since it may be playing.', lastPlayed, playtime);
+        if (row.id in tracksToDelete) {
+          delete tracksToDelete[row.id];
+        } else {
+          delete tracksToDelete[row.storeId];
+        }
+      }
+    });
+
+    const deletes = Gmoauth.buildEntryDeletes(Object.values(tracksToDelete));
+    for (let i = 0; i < deletes.length; i++) {
+      mutations.push(deletes[i]);
+    }
+
+    Trackcache.queryTracks(db, splaylistcache, playlist, new Set(), tracks => {
+      if (tracks === null) {
+        Reporting.reportSync('failure', 'failed-query');
+        return;
+      }
+
+      console.debug(playlist.title, 'found', tracks.length);
+      if (tracks.length > 0) {
+        console.debug('first is', tracks[0]);
+      }
+      if (tracks.length > 1000) {
+        console.warn('attempting to sync over 1000 tracks; only first 1k will sync');
+      }
+
+      const desiredTracks = tracks.slice(0, 1000);
+      const desiredIds = [];
+      for (let i = 0; i < desiredTracks.length; i++) {
+        desiredIds.push(desiredTracks[i].id);
+      }
+      const appends = Gmoauth.buildEntryAppends(playlist.remoteId, desiredIds);
+      for (let i = 0; i < appends.length; i++) {
+        mutations.push(appends[i]);
+      }
+
+      callback(mutations);
+    });
+  });
+}
+
 function syncPlaylist(playlist, playlists) {
   // Sync a playlist's metadata and contents.
   // A remote playlist will be created if one does not exist yet.
-  console.log('syncing', playlist.title);
+  console.log('syncPlaylist', playlist.title);
   const user = users[playlist.userId];
   const splaylistcache = splaylistcaches[playlist.userId];
 
-  if (!('remoteId' in playlist)) {
-    // The remote playlist doesn't exist yet.
-    Gm.createRemotePlaylist(user, playlist.title, remoteId => {
-      console.log('created remote playlist', remoteId);
-      const playlistToSave = JSON.parse(JSON.stringify(playlist));
-      playlistToSave.remoteId = remoteId;
+  Storage.getNewSyncEnabled(newSyncEnabled => {
+    if (!('remoteId' in playlist)) {
+      // The remote playlist doesn't exist yet.
+      if (newSyncEnabled) {
+        const add = Gmoauth.buildPlaylistAdd(playlist.title, getDescription(playlist, splaylistcache, playlists));
+        Gmoauth.runPlaylistMutations(user, [add], response => {
+          postCreate(playlist, response);
+        });
+      } else {
+        Gm.createRemotePlaylist(user, playlist.title, remoteId => {
+          legacyPostCreate(playlist, remoteId);
+        });
+      }
+    } else {
+      if (newSyncEnabled) {
+        syncSplaylistcache(playlist.userId).then(() => {
+          // Unfortunately playlist and entry updates can't be batched.
+          const playlistMutations = getPlaylistMutations(playlist, splaylistcache, playlists);
+          Gmoauth.runPlaylistMutations(user, playlistMutations, response => {
+            console.log('update res', response);
+          });
 
-      Storage.savePlaylist(playlistToSave, () => {
-        // nothing else to do. listener will see the change and recall.
-        console.debug('wrote remote id');
+          getEntryMutations(playlist, splaylistcache, mutations => {
+            Gmoauth.runEntryMutations(user, mutations, response => {
+              console.log('entry res', response);
+            });
+          });
+        });
+      } else {
+        Gm.updatePlaylist(user, playlist.remoteId, playlist.title, playlist, playlists, splaylistcache, () => {
+          syncPlaylistContents(playlist);
+        });
+      }
+    }
+  });
+}
+
+function postCreate(playlist, response) {
+  console.log('postCreate', response);
+  const remoteId = response.mutate_response[0].id;
+  legacyPostCreate(playlist, remoteId);
+}
+
+function legacyPostCreate(playlist, remoteId) {
+  console.log('created remote playlist', remoteId);
+  const playlistToSave = JSON.parse(JSON.stringify(playlist));
+  playlistToSave.remoteId = remoteId;
+
+  Storage.savePlaylist(playlistToSave, () => {
+    // nothing else to do. listener will see the change and recall.
+    console.debug('wrote remote id');
+  });
+}
+
+function syncEntryMutations(hasFullVersion, splaylistcache, user, playlists) {
+  const entryMutations = [];
+  let callbacksRemaining = playlists.length;
+
+  function processMutations(mutations) {
+    for (let j = 0; j < mutations.length; j++) {
+      entryMutations.push(mutations[j]);
+    }
+    callbacksRemaining--;
+
+    if (callbacksRemaining <= 0) {
+      Gmoauth.runEntryMutations(user, entryMutations, response => {
+        console.log('combined entry res', response);
       });
-    });
-  } else {
-    Gm.updatePlaylist(user, playlist.remoteId, playlist.title, playlist, playlists, splaylistcache, () => {
-      syncPlaylistContents(playlist);
-    });
+    }
+  }
+
+  for (let i = 0; i < playlists.length; i++) {
+    const playlist = playlists[i];
+
+    if (i > 0 && !hasFullVersion) {
+      console.info('skipping sync of locked playlist', playlist.title);
+      callbacksRemaining--;
+      continue;
+    }
+
+    getEntryMutations(playlist, splaylistcache, processMutations);
+  }
+}
+
+function syncPlaylistMutations(hasFullVersion, splaylistcache, user, playlists) {
+  const playlistMutations = [];
+  let callbacksRemaining = playlists.length;
+
+  function processMutations(mutations) {
+    for (let j = 0; j < mutations.length; j++) {
+      playlistMutations.push(mutations[j]);
+    }
+    callbacksRemaining--;
+
+    if (callbacksRemaining <= 0) {
+      Gmoauth.runPlaylistMutations(user, playlistMutations, response => {
+        console.log('combined playlist res', response);
+      });
+    }
+  }
+
+  for (let i = 0; i < playlists.length; i++) {
+    const playlist = playlists[i];
+
+    if (i > 0 && !hasFullVersion) {
+      console.info('skipping sync of locked playlist', playlist.title);
+      callbacksRemaining--;
+      continue;
+    }
+
+    processMutations(getPlaylistMutations(playlist, splaylistcache, playlists));
   }
 }
 
 function syncPlaylists(userId) {
+  console.log('syncPlaylists', userId);
   const db = dbs[userId];
+  const splaylistcache = splaylistcaches[userId];
+  const user = users[userId];
 
   if (!db) {
     console.warn('refusing syncPlaylists because db is not init');
@@ -243,36 +436,60 @@ function syncPlaylists(userId) {
 
   License.hasFullVersion(false, hasFullVersion => {
     Storage.getPlaylistsForUser(userId, playlists => {
-      for (let i = 0; i < playlists.length; i++) {
-        if (i > 0 && !hasFullVersion) {
-          console.info('skipping sync of locked playlist', playlists[i].title);
-          continue;
-        }
-        // This locking prevents two things:
-        //   * slow periodic syncs from stepping on later periodic syncs
-        //   * periodic syncs from stepping on manual syncs
-        if (playlistIsUpdating[playlists[i].remoteId]) {
-          console.warn('skipping sync since playlist is being updated:', playlists[i].title);
+      Storage.getNewSyncEnabled(newSyncEnabled => {
+        if (newSyncEnabled) {
+          // These don't need to be ordered since the playlists we're modifying should exist already.
+          syncEntryMutations(hasFullVersion, splaylistcache, user, playlists);
+          syncPlaylistMutations(hasFullVersion, splaylistcache, user, playlists);
         } else {
-          syncPlaylist(playlists[i], playlists);
+          for (let i = 0; i < playlists.length; i++) {
+            const playlist = playlists[i];
+
+            if (i > 0 && !hasFullVersion) {
+              console.info('skipping sync of locked playlist', playlist.title);
+              continue;
+            }
+
+            // This locking prevents two things:
+            //   * slow periodic syncs from stepping on later periodic syncs
+            //   * periodic syncs from stepping on manual syncs
+            if (playlistIsUpdating[playlist.remoteId]) {
+              console.warn('skipping sync since playlist is being updated:', playlist.title);
+            } else {
+              syncPlaylist(playlist, playlists);
+            }
+          }
         }
-      }
+      });
     });
   });
 }
 
 function syncSplaylistcache(userId) {
+  // Promise nothing when the cache is updated.
   const splaylistcache = splaylistcaches[userId];
 
-  Storage.getPlaylistsForUser(userId, playlists => {
-    Splaylistcache.sync(splaylistcache, users[userId], playlists, deletedIds => {
-      for (const deletedId of deletedIds) {
-        Playlist.deleteAllReferences('P' + deletedId, playlists);
-        for (let i = 0; i < playlists.length; i++) {
-          Storage.savePlaylist(playlists[i], () => {});
-        }
+  const playlistsP = new Promise(resolve => {
+    Storage.getPlaylistsForUser(userId, resolve);
+  });
+
+  const deletedIdsP = playlistsP.then(playlists =>
+    new Promise(resolve => {
+      Splaylistcache.sync(splaylistcache, users[userId], playlists, resolve);
+    })
+  );
+
+  return Promise.all([playlistsP, deletedIdsP])
+  .then(params => {
+    const playlists = params[0];
+    const deletedIds = params[1];
+    for (const deletedId of deletedIds) {
+      Playlist.deleteAllReferences('P' + deletedId, playlists);
+      for (let i = 0; i < playlists.length; i++) {
+        // FIXME this sucks?
+        Storage.savePlaylist(playlists[i], () => {});
       }
-    });
+    }
   });
 }
 
@@ -369,22 +586,23 @@ function periodicUpdate() {
   for (const userId in users) {
     console.log('periodic update for', userId);
 
-    syncSplaylistcache(userId);
-
-    if (dbs[userId]) {
-      diffUpdateTrackcache(userId, dbs[userId], response => {
-        console.debug('periodic diffUpdate:', response.success, response);
-        syncPlaylists(userId);
-      });
-    } else {
-      // Retry to init the library.
-      console.warn('db not init at periodic sync');
-      Reporting.Raven.captureMessage('db not init at periodic sync', {
-        level: 'warning',
-        extra: {users},
-      });
-      initLibrary(userId, () => null);
-    }
+    syncSplaylistcache(userId)
+    .then(() => {
+      if (dbs[userId]) {
+        diffUpdateTrackcache(userId, dbs[userId], response => {
+          console.debug('periodic diffUpdate:', response.success, response);
+          syncPlaylists(userId);
+        });
+      } else {
+        // Retry to init the library.
+        console.warn('db not init at periodic sync');
+        Reporting.Raven.captureMessage('db not init at periodic sync', {
+          level: 'warning',
+          extra: {users},
+        });
+        initLibrary(userId, () => null);
+      }
+    });
   }
 }
 
@@ -434,6 +652,14 @@ function initLibrary(userId, callback) {
 
 
 function main() {
+  Storage.getNewSyncEnabled(newSyncEnabled => {
+    if (newSyncEnabled) {
+      console.info('new sync is enabled!');
+    } else {
+      console.log('using legacy sync');
+    }
+  });
+
   chrome.identity.getProfileUserInfo(userInfo => {
     primaryGaiaId = userInfo.id;
   });
@@ -467,12 +693,27 @@ function main() {
   });
 
   chrome.pageAction.onClicked.addListener(tab => {
+    chrome.notifications.clear('zeroPlaylists');
     const userId = userIdForTabId(tab.id);
     if (userId) {
-      const qstring = Qs.stringify({userId: userIdForTabId(tab.id)});
-      const url = chrome.extension.getURL('html/playlists.html');
-      Chrometools.focusOrCreateExtensionTab(`${url}?${qstring}`);
-      chrome.notifications.clear('zeroPlaylists');
+      chrome.identity.getAuthToken({interactive: false}, token => {
+        if (chrome.runtime.lastError) {
+          console.info('not authorized; asking for auth', chrome.runtime.lastError);
+          chrome.identity.getAuthToken({interactive: true}, token2 => {
+            if (!(chrome.runtime.lastError)) {
+              console.info('got auth', token2);
+              const qstring = Qs.stringify({userId: userIdForTabId(tab.id)});
+              const url = chrome.extension.getURL('html/playlists.html');
+              Chrometools.focusOrCreateExtensionTab(`${url}?${qstring}`);
+            }
+          });
+        } else {
+          console.info('got token', token);
+          const qstring = Qs.stringify({userId: userIdForTabId(tab.id)});
+          const url = chrome.extension.getURL('html/playlists.html');
+          Chrometools.focusOrCreateExtensionTab(`${url}?${qstring}`);
+        }
+      });
     } else {
       // Only the primary user is ever put into the users array.
       Reporting.Raven.captureMessage('multiuser page action click', {
@@ -553,6 +794,12 @@ function main() {
         }
       }
 
+      let tier = 'free';
+      if (request.tier === 2) {
+        tier = 'aa';
+      }
+
+      users[request.userId] = {userIndex: request.userIndex, tabId: sender.tab.id, xt: request.xt, tier};
       console.log('see user', request.userId, users);
       if (request.gaiaId !== primaryGaiaId) {
         console.warn('user is not the primary user');
@@ -560,7 +807,6 @@ function main() {
         return;
       }
 
-      users[request.userId] = {userIndex: request.userIndex, tabId: sender.tab.id, xt: request.xt};
       License.hasFullVersion(false, hasFullVersion => { console.log('precached license status:', hasFullVersion); });
 
       // FIXME store this in sync storage and include it in context?
