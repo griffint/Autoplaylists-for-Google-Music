@@ -304,8 +304,6 @@ function getEntryMutations(playlist, splaylistcache, callback) {
       trackIdsRemaining.push(id);
     }
 
-    console.log('remaining (to order)', trackIdsRemaining);
-
     return new Promise(resolve => {
       Trackcache.orderTracks(db, playlist, trackIdsRemaining, resolve);
     });
@@ -339,7 +337,6 @@ function getEntryMutations(playlist, splaylistcache, callback) {
         clientId = uuidV1();
         entryId = entriesToKeep[track.id] || entriesToKeep[track.storeId];
       } else {
-        console.log('look up', track, 'in', appendsByTrackId);
         // We only build appends with library id.
         append = appendsByTrackId[track.id];
         type = 'append';
@@ -351,7 +348,6 @@ function getEntryMutations(playlist, splaylistcache, callback) {
     const reorderings = [];
     for (let i = 0; i < desiredOrdering.length; i++) {
       const ordering = desiredOrdering[i];
-      console.log(i, ordering);
       let target;
       if (ordering.type === 'existing') {
         target = {id: ordering.entryId, clientId: ordering.clientId};
@@ -363,15 +359,12 @@ function getEntryMutations(playlist, splaylistcache, callback) {
       target.relativePositionIdType = 2;
       if (i > 0) {
         target.precedingEntryId = desiredOrdering[i - 1].clientId;
-        console.log('set preceding', target);
       }
       if (i < desiredOrdering.length - 1) {
         target.followingEntryId = desiredOrdering[i + 1].clientId;
-        console.log('set following', target);
       }
     }
 
-    console.log('final reorderings', reorderings);
     const reorders = Gmoauth.buildEntryReorders(reorderings);
     for (let i = 0; i < reorders.length; i++) {
       mutations.push(reorders[i]);
