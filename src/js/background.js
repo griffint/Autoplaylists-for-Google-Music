@@ -36,6 +36,14 @@ let primaryGaiaId = null;
 
 let syncsHaveStarted = false;
 
+// TODO dedupe
+/* eslint-disable */
+// Source: https://gist.github.com/jed/982883.
+function uuidV1(a){
+  return a?(a^Math.random()*16>>a/4).toString(16):([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, uuidV1)
+}
+/* eslint-enable */
+
 function userIdForTabId(tabId) {
   for (const userId in users) {
     if (users[userId].tabId === tabId) {
@@ -216,41 +224,69 @@ function getPlaylistMutations(playlist, splaylistcache, playlists) {
 
 
 function getEntryMutations(playlist, splaylistcache, callback) {
-  const mutations = [];
-
   console.log('cache', playlist.remoteId, splaylistcache);
-  let entries = [];
+  let currentEntries = {};
   if (playlist.remoteId in splaylistcache.splaylists) {
-    entries = splaylistcache.splaylists[playlist.remoteId].entries;
+    currentEntries = splaylistcache.splaylists[playlist.remoteId].entries;
   } else {
     console.warn('playlist.remoteId', playlist.remoteId, 'not yet cached; assuming empty');
   }
 
-  // Don't delete tracks that are currently playing.
-  // This will put them at the top of the playlist until they're finished.
-
-  // Copy the entries to allow modifications and index on track id.
-  // If there are multiple entries for the same track we'll just leave all of them
-  // (since we can't tell which one is actually playing).
-  const tracksToDelete = {};
-  for (const entryId in entries) {
-    tracksToDelete[entries[entryId]] = entryId;
-  }
+  // We'll make three kinds of mutations:
+  //   1) delete tracks we don't want (that aren't currently playing)
+  //   2) add tracks we're missing
+  //   3) reorder the resulting tracks
+  // These can all be batched.
+  // As opposed to a simpler delete-all+add-all approach, this:
+  //   * reduces our request sizes and the work for Google
+  //   * avoids clearing out tracks that are currently playing that we don't know of yet
 
   const db = dbs[playlist.userId];
-  const candidateTrackIds = Object.keys(tracksToDelete);
-  console.log('candidates', candidateTrackIds);
-  const track = db.getSchema().table('Track');
-  db.select().from(track).where(
-    // We don't know if these entries name a library or store id.
-    Lf.op.or(track.id.in(candidateTrackIds),
-             track.storeId.in(candidateTrackIds))
-  ).exec().then(rows => {
+  const mutations = [];
+  const desiredOrdering = [];
+  let tracksToAdd;
+  let tracksToDelete;
+  let deleteIdCandidates;
+  let entriesToKeep;
+
+  new Promise(resolve => {
+    Trackcache.queryTracks(db, splaylistcache, playlist, {}, resolve);
+  }).then(tracks => {
+    const desiredTracks = tracks.slice(0, 1000);
+
+    // We'll reorder these later.
+    tracksToAdd = new Set(desiredTracks.map(t => t.id));
+    console.log('query found', tracksToAdd);
+
+    tracksToDelete = {};
+    entriesToKeep = {};
+    for (const entryId in currentEntries) {
+      const remoteTrackId = currentEntries[entryId];
+
+      if (tracksToAdd.has(remoteTrackId)) {
+        console.log('no need to add', remoteTrackId);
+        tracksToAdd.delete(remoteTrackId);
+        entriesToKeep[remoteTrackId] = entryId;
+      } else {
+        // This assumes that there are no duplicates in the remote, which will probably break eventually.
+        console.log('want to delete', entryId);
+        tracksToDelete[remoteTrackId] = entryId;
+      }
+    }
+
+    // Don't delete tracks that are currently playing.
+    deleteIdCandidates = Object.keys(tracksToDelete);
+    const track = db.getSchema().table('Track');
+    return db.select().from(track).where(
+      // We don't know if these entries name a library or store id.
+      Lf.op.or(track.id.in(deleteIdCandidates),
+               track.storeId.in(deleteIdCandidates))
+    ).exec();
+  }).then(rows => {
     const nowMillis = new Date().getTime();
     const delayMillis = 0;
 
     rows.forEach(row => {
-      console.log('check', row, 'for playing', lastPlayed, playtime);
       const lastPlayed = delayMillis + (row.lastPlayed / 1000);
       const playtime = nowMillis - row.durationMillis;
       if (lastPlayed > playtime) {
@@ -263,37 +299,85 @@ function getEntryMutations(playlist, splaylistcache, callback) {
       }
     });
 
+    const trackIdsRemaining = Object.keys(entriesToKeep);
+    for (const id of tracksToAdd) {
+      trackIdsRemaining.push(id);
+    }
+
+    console.log('remaining (to order)', trackIdsRemaining);
+
+    return new Promise(resolve => {
+      Trackcache.orderTracks(db, playlist, trackIdsRemaining, resolve);
+    });
+  }).then(orderedTracks => {
+    console.log('to add', tracksToAdd);
+    console.log('to keep', entriesToKeep);
+    console.log('to delete', tracksToDelete);
+    console.log('in order', orderedTracks);
+
+    const appends = Gmoauth.buildEntryAppends(playlist.remoteId, Array.from(tracksToAdd));
+    const appendsByTrackId = {};
+    for (let i = 0; i < appends.length; i++) {
+      const append = appends[i];
+      mutations.push(append);
+      appendsByTrackId[append.create.trackId] = append.create;
+    }
     const deletes = Gmoauth.buildEntryDeletes(Object.values(tracksToDelete));
     for (let i = 0; i < deletes.length; i++) {
       mutations.push(deletes[i]);
     }
 
-    Trackcache.queryTracks(db, splaylistcache, playlist, new Set(), tracks => {
-      if (tracks === null) {
-        Reporting.reportSync('failure', 'failed-query');
-        return;
+    for (let i = 0; i < orderedTracks.length; i++) {
+      const track = orderedTracks[i];
+      let clientId;
+      let type;
+      let entryId;
+      let append;
+
+      if (track.id in entriesToKeep || track.storeId in entriesToKeep) {
+        type = 'existing';
+        clientId = uuidV1();
+        entryId = entriesToKeep[track.id] || entriesToKeep[track.storeId];
+      } else {
+        console.log('look up', track, 'in', appendsByTrackId);
+        // We only build appends with library id.
+        append = appendsByTrackId[track.id];
+        type = 'append';
+        clientId = append.clientId;
+      }
+      desiredOrdering.push({type, clientId, entryId, append});
+    }
+
+    const reorderings = [];
+    for (let i = 0; i < desiredOrdering.length; i++) {
+      const ordering = desiredOrdering[i];
+      console.log(i, ordering);
+      let target;
+      if (ordering.type === 'existing') {
+        target = {id: ordering.entryId, clientId: ordering.clientId};
+        reorderings.push(target);
+      } else {
+        target = ordering.append;
       }
 
-      console.debug(playlist.title, 'found', tracks.length);
-      if (tracks.length > 0) {
-        console.debug('first is', tracks[0]);
+      target.relativePositionIdType = 2;
+      if (i > 0) {
+        target.precedingEntryId = desiredOrdering[i - 1].clientId;
+        console.log('set preceding', target);
       }
-      if (tracks.length > 1000) {
-        console.warn('attempting to sync over 1000 tracks; only first 1k will sync');
+      if (i < desiredOrdering.length - 1) {
+        target.followingEntryId = desiredOrdering[i + 1].clientId;
+        console.log('set following', target);
       }
+    }
 
-      const desiredTracks = tracks.slice(0, 1000);
-      const desiredIds = [];
-      for (let i = 0; i < desiredTracks.length; i++) {
-        desiredIds.push(desiredTracks[i].id);
-      }
-      const appends = Gmoauth.buildEntryAppends(playlist.remoteId, desiredIds);
-      for (let i = 0; i < appends.length; i++) {
-        mutations.push(appends[i]);
-      }
-
-      callback(mutations);
-    });
+    console.log('final reorderings', reorderings);
+    const reorders = Gmoauth.buildEntryReorders(reorderings);
+    for (let i = 0; i < reorders.length; i++) {
+      mutations.push(reorders[i]);
+    }
+    console.log('mutations', mutations);
+    callback(mutations);
   });
 }
 

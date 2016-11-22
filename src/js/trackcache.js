@@ -270,12 +270,12 @@ exports.queryTracks = function queryTracks(db, splaylistcache, playlist, resultC
   });
 };
 
-exports.orderTracks = function orderTracks(db, playlist, tracks, callback, onError) {
+exports.orderTracks = function orderTracks(db, playlist, trackIds, callback, onError) {
   // Return a copy of tracks, ordered by playlist's sort rules.
   // Tracks that wouldn't normally be in playlist are allowed.
 
   const track = db.getSchema().table('Track');
-  const whereClause = track.id.in(tracks.map(t => t.id));
+  const whereClause = track.id.in(trackIds);
 
   execQuery(db, track, whereClause, playlist, callback, onError);
 };

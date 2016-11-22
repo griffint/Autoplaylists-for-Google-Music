@@ -348,6 +348,16 @@ exports.buildEntryDeletes = function buildEntryDeletes(entryIds) {
   return mutations;
 };
 
+exports.buildEntryReorders = function buildEntryReorders(reorders) {
+  const mutations = [];
+
+  for (let i = 0; i < reorders.length; i++) {
+    mutations.push({'update': reorders[i]});
+  }
+
+  return mutations;
+};
+
 exports.buildEntryAppends = function buildEntryAppends(playlistId, trackIds) {
   const mutations = [];
   let prevId = null;
@@ -408,7 +418,7 @@ exports.setPlaylistContents = function setPlaylistContents(db, user, playlistId,
 
   console.log('cache', playlistId, splaylistcache);
 
-  let entries = [];
+  let entries = {};
   if (playlistId in splaylistcache.splaylists) {
     entries = splaylistcache.splaylists[playlistId].entries;
   } else {
