@@ -233,20 +233,19 @@ function getEntryMutations(playlist, splaylistcache, callback) {
   }
 
   // We'll make three kinds of mutations:
-  //   1) delete tracks we don't want (that aren't currently playing)
+  //   1) delete tracks we don't want
   //   2) add tracks we're missing
   //   3) reorder the resulting tracks
   // These can all be batched.
   // As opposed to a simpler delete-all+add-all approach, this:
   //   * reduces our request sizes and the work for Google
-  //   * avoids clearing out tracks that are currently playing that we don't know of yet
+  //   * avoids deleting tracks that are currently playing but we don't know about
 
   const db = dbs[playlist.userId];
   const mutations = [];
   const desiredOrdering = [];
   let tracksToAdd;
   let tracksToDelete;
-  let deleteIdCandidates;
   let entriesToKeep;
 
   new Promise(resolve => {
@@ -273,31 +272,6 @@ function getEntryMutations(playlist, splaylistcache, callback) {
         tracksToDelete[remoteTrackId] = entryId;
       }
     }
-
-    // Don't delete tracks that are currently playing.
-    deleteIdCandidates = Object.keys(tracksToDelete);
-    const track = db.getSchema().table('Track');
-    return db.select().from(track).where(
-      // We don't know if these entries name a library or store id.
-      Lf.op.or(track.id.in(deleteIdCandidates),
-               track.storeId.in(deleteIdCandidates))
-    ).exec();
-  }).then(rows => {
-    const nowMillis = new Date().getTime();
-    const delayMillis = 0;
-
-    rows.forEach(row => {
-      const lastPlayed = delayMillis + (row.lastPlayed / 1000);
-      const playtime = nowMillis - row.durationMillis;
-      if (lastPlayed > playtime) {
-        console.info('not deleting', row, 'since it may be playing.', lastPlayed, playtime);
-        if (row.id in tracksToDelete) {
-          delete tracksToDelete[row.id];
-        } else {
-          delete tracksToDelete[row.storeId];
-        }
-      }
-    });
 
     const trackIdsRemaining = Object.keys(entriesToKeep);
     for (const id of tracksToAdd) {
