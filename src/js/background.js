@@ -430,7 +430,7 @@ function syncEntryMutations(hasFullVersion, splaylistcache, user, playlists) {
     const playlist = playlists[i];
 
     if (i > 0 && !hasFullVersion) {
-      console.info('skipping sync of locked playlist', playlist.title);
+      console.info('skipping (entry) sync of locked playlist', playlist.title);
       callbacksRemaining--;
       continue;
     }
@@ -460,7 +460,7 @@ function syncPlaylistMutations(hasFullVersion, splaylistcache, user, playlists) 
     const playlist = playlists[i];
 
     if (i > 0 && !hasFullVersion) {
-      console.info('skipping sync of locked playlist', playlist.title);
+      console.info('skipping (playlist) sync of locked playlist', playlist.title);
       callbacksRemaining--;
       continue;
     }
@@ -868,10 +868,13 @@ function main() {
 
       // init the caches.
       initLibrary(request.userId, () => {
-        initSyncSchedule();
+        splaylistcaches[request.userId] = Splaylistcache.open();
+        console.log('see user update');
+        syncSplaylistcache(request.userId).then(() => {
+          // This must be done after the caches are set up to avoid periodic updates racing them.
+          initSyncSchedule();
+        });
       });
-      splaylistcaches[request.userId] = Splaylistcache.open();
-      syncSplaylistcache(request.userId);
 
       chrome.pageAction.show(sender.tab.id);
 
