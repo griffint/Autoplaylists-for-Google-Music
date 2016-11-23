@@ -65,7 +65,7 @@ function authedGMRequest(options, callback, onError) {
     $.ajax(request)
     .fail(ajaxOnError)
     .done(callback);
-  }));
+  }, ajaxOnError));
 }
 
 exports.buildPlaylistAdd = function buildPlaylistAdd(name, description) {

@@ -2,6 +2,7 @@
 
 const Qs = require('qs');
 
+const Auth = require('./auth');
 const Chrometools = require('./chrometools');
 const Gm = require('./googlemusic');
 const Gmoauth = require('./googlemusic_oauth');
@@ -262,12 +263,10 @@ function getEntryMutations(playlist, splaylistcache, callback) {
       const remoteTrackId = currentEntries[entryId];
 
       if (tracksToAdd.has(remoteTrackId)) {
-        console.log('no need to add', remoteTrackId);
         tracksToAdd.delete(remoteTrackId);
         entriesToKeep[remoteTrackId] = entryId;
       } else {
         // This assumes that there are no duplicates in the remote, which will probably break eventually.
-        console.log('want to delete', entryId);
         tracksToDelete[remoteTrackId] = entryId;
       }
     }
@@ -702,11 +701,39 @@ function initLibrary(userId, callback) {
 
 
 function main() {
+  Auth.getToken(false, 'startup', token => {
+    // Prompt existing users for auth immediately to avoid missed syncs.
+    if (!token) {
+      chrome.storage.sync.get(null, Chrometools.unlessError(items => {
+        let hasPlaylists = false;
+        for (const key in items) {
+          try {
+            const parsedKey = JSON.parse(key);
+            if (parsedKey[0] === 'playlist') {
+              hasPlaylists = true;
+              break;
+            }
+          } catch (SyntaxError) {
+            // eslint-disable-line no-empty
+          }
+        }
+
+        if (hasPlaylists) {
+          console.info('playlists detected; will prompt for auth');
+          const url = chrome.extension.getURL('html/new-syncing.html');
+          Chrometools.focusOrCreateExtensionTab(url);
+        }
+      }));
+    }
+  });
+
   Storage.getNewSyncEnabled(newSyncEnabled => {
     if (newSyncEnabled) {
       console.info('new sync is enabled!');
+      Reporting.reportHit('newSyncEnabled');
     } else {
       console.log('using legacy sync');
+      Reporting.reportHit('newSyncDisabled');
     }
   });
 
@@ -746,19 +773,19 @@ function main() {
     chrome.notifications.clear('zeroPlaylists');
     const userId = userIdForTabId(tab.id);
     if (userId) {
-      chrome.identity.getAuthToken({interactive: false}, token => {
-        if (chrome.runtime.lastError) {
-          console.info('not authorized; asking for auth', chrome.runtime.lastError);
-          chrome.identity.getAuthToken({interactive: true}, token2 => {
-            if (!(chrome.runtime.lastError)) {
-              console.info('got auth', token2);
+      Auth.getToken(false, 'pageAction', token => {
+        if (!token) {
+          console.info('asking for auth');
+          Auth.getToken(true, 'pageAction', token2 => {
+            if (token2) {
+              console.info('got auth on prompt', token2.slice(0, 10));
               const qstring = Qs.stringify({userId: userIdForTabId(tab.id)});
               const url = chrome.extension.getURL('html/playlists.html');
               Chrometools.focusOrCreateExtensionTab(`${url}?${qstring}`);
             }
           });
         } else {
-          console.info('got token', token);
+          console.log('already had auth', token.slice(0, 10));
           const qstring = Qs.stringify({userId: userIdForTabId(tab.id)});
           const url = chrome.extension.getURL('html/playlists.html');
           Chrometools.focusOrCreateExtensionTab(`${url}?${qstring}`);

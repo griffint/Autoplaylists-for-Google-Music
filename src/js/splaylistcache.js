@@ -66,9 +66,7 @@ function newSync(cache, user, playlists, callback) {
         const splaylist = cache.splaylists[mutation.playlistId];
 
         if (!splaylist) {
-          if (!(mutation.deleted)) {
-            console.warn('splaylist is', splaylist, 'for', mutation);
-          }
+          // These orphaned entries usually belong to a playlist that was recently deleted.
           continue;
         }
 
