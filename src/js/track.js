@@ -267,9 +267,6 @@ exports.fromJsproto = function fromJsproto(jsproto) {
   return track;
 };
 
-exports.fromSJ = function fromSJ(sjJson) {
-};
-
 exports.toString = function toString(track) {
   let output = '';
   for (const key in track) {

@@ -154,7 +154,6 @@ function syncPlaylistContents(playlist, attempt) {
     const desiredTracks = tracks.slice(0, 1000);
 
     Gm.setPlaylistContents(db, user, playlist.remoteId, desiredTracks, response => {
-    // Gmoauth.setPlaylistContents(db, user, playlist.remoteId, desiredTracks, splaylistcache, response => {
       if (response !== null) {
         // large updates seem to only apply partway sometimes.
         // retrying like this seems to make even 1k playlists eventually consistent.
@@ -369,7 +368,7 @@ function syncPlaylist(playlist, playlists) {
         });
       }
     } else {
-      if (newSyncEnabled) {
+      if (newSyncEnabled) {  // eslint-disable-line no-lonely-if
         syncSplaylistcache(playlist.userId).then(() => {
           // Unfortunately playlist and entry updates can't be batched.
           const playlistMutations = getPlaylistMutations(playlist, splaylistcache, playlists);
